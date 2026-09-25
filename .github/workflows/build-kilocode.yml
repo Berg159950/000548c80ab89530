@@ -1,0 +1,434 @@
+name: build-kilocode-penryn
+
+on:
+  workflow_dispatch:
+    inputs:
+      kilocode_tag:
+        description: KiloCode tag to build (empty = latest stable)
+        required: false
+        default: ""
+      bun_url:
+        description: Penryn Bun archive URL
+        required: false
+        default: ""
+      bun_sha256:
+        description: SHA256 of Bun archive
+        required: false
+        default: ""
+      zig_url:
+        description: Zig download URL
+        required: false
+        default: "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz"
+      zig_sha256:
+        description: SHA256 of Zig archive
+        required: false
+        default: "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  KILOCODE_TAG: ${{ github.event.inputs.kilocode_tag }}
+  BUN_URL: ${{ github.event.inputs.bun_url }}
+  BUN_SHA256: ${{ github.event.inputs.bun_sha256 }}
+  ZIG_URL: ${{ github.event.inputs.zig_url }}
+  ZIG_SHA256: ${{ github.event.inputs.zig_sha256 }}
+  BWRAP_COMMIT: 1b80120ef26a28e065e67f89bfef873f13bdd317
+  BWRAP_SHA256: 55a1f42de8f62f6cd8cc414229ce166ec6128ca4386b8c25dfca4229e44b56aa
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve KiloCode tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "$KILOCODE_TAG" ]; then
+            TAG="$KILOCODE_TAG"
+          else
+            TAG=$(curl -fsSL --connect-timeout 20 --max-time 900 -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/kilo-org/kilocode/releases?per_page=20" | grep -oP '"tag_name":\s*"\Kv[0-9][^"]*' | head -1 || true)
+            if [ -z "$TAG" ]; then
+              TAG=$(curl -fsSL --connect-timeout 20 --max-time 900 -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/kilo-org/kilocode/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+' | head -1 || true)
+            fi
+          fi
+          [ -n "$TAG" ] || { echo "Failed to resolve KiloCode tag"; exit 1; }
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=${TAG#v}" >> $GITHUB_OUTPUT
+          echo "Using KiloCode tag: $TAG"
+
+      - name: Restore intermediate build
+        id: restore
+        uses: dawidd6/action-download-artifact@v6
+        continue-on-error: true
+        with:
+          workflow: build-kilocode.yml
+          name: stage-kilocode-linux-x64-${{ steps.tag.outputs.version }}-${{ hashFiles('.github/workflows/build-kilocode.yml') }}
+          path: /tmp/stage
+          if_no_artifact_found: warn
+
+      - name: Restore Zig cache
+        if: steps.restore.outputs.found_artifact != 'true'
+        id: zig-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/zig-cache/
+          key: zig-${{ env.ZIG_SHA256 }}
+
+      - name: Setup Zig
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          if [ -f /tmp/zig-cache/zig.tar.xz ]; then
+            cp /tmp/zig-cache/zig.tar.xz /tmp/zig.tar.xz
+            echo "Zig restored from cache"
+          else
+            echo "Downloading Zig from $ZIG_URL"
+            for i in 1 2 3 4 5; do
+              if curl -fsSL --connect-timeout 20 --max-time 900 "$ZIG_URL" -o /tmp/zig.tar.xz; then break; fi
+              echo "Zig download attempt $i failed (curl exit $?)"
+              rm -f /tmp/zig.tar.xz
+              [ $i -lt 5 ] && sleep 30
+            done
+            [ -s /tmp/zig.tar.xz ] || { echo "Zig download failed: $ZIG_URL"; exit 1; }
+            if [ -n "$ZIG_SHA256" ]; then
+              echo "$ZIG_SHA256  /tmp/zig.tar.xz" | sha256sum -c
+            fi
+            mkdir -p /tmp/zig-cache
+            cp /tmp/zig.tar.xz /tmp/zig-cache/zig.tar.xz
+          fi
+          sudo tar xf /tmp/zig.tar.xz -C /usr/local
+          ZIG_DIR=$(ls -d /usr/local/zig-* 2>/dev/null | head -1 || true)
+          if [ -n "$ZIG_DIR" ]; then
+            echo "$ZIG_DIR" >> $GITHUB_PATH
+          else
+            echo "Zig directory not found after extraction"
+            exit 1
+          fi
+
+      - name: Save Zig cache
+        if: steps.restore.outputs.found_artifact != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/zig-cache/
+          key: zig-${{ env.ZIG_SHA256 }}
+
+      - name: Restore Bun archive cache
+        id: bun-dl-cache
+        if: steps.restore.outputs.found_artifact != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/bun-dl-cache.tar.gz
+          key: dl-bun-linux-${{ env.BUN_SHA256 }}
+
+      - name: Download Bun
+        if: steps.restore.outputs.found_artifact != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          [ -n "$BUN_URL" ] || { echo "BUN_URL is required"; exit 1; }
+          if [ -n "$BUN_SHA256" ] && [ -s /tmp/bun-dl-cache.tar.gz ] && echo "$BUN_SHA256  /tmp/bun-dl-cache.tar.gz" | sha256sum -c --quiet; then
+            echo "Bun archive restored from cache"
+            cp /tmp/bun-dl-cache.tar.gz /tmp/bun.tar.gz
+          else
+          for i in 1 2 3; do
+            if curl -fsSL --connect-timeout 20 --max-time 900 -H "Authorization: token $GH_TOKEN" "$BUN_URL" -o /tmp/bun.tar.gz 2>/dev/null && [ -s /tmp/bun.tar.gz ]; then break; fi
+            if curl -fsSL --connect-timeout 20 --max-time 900 "$BUN_URL" -o /tmp/bun.tar.gz && [ -s /tmp/bun.tar.gz ]; then break; fi
+            [ $i -lt 3 ] && sleep 10
+          done
+          if [ ! -s /tmp/bun.tar.gz ]; then
+            REPO=$(echo "$BUN_URL" | sed -E 's|https://github.com/([^/]+/[^/]+)/releases/download/.*|\1|')
+            TAG=$(echo "$BUN_URL" | sed -E 's|.*/releases/download/([^/]+)/.*|\1|')
+            FILE=$(basename "$BUN_URL")
+            echo "Direct download failed, trying gh release download for $REPO $TAG $FILE"
+            gh release download "$TAG" --repo "$REPO" --pattern "$FILE" --dir /tmp --clobber 2>&1 || true
+            [ -f "/tmp/$FILE" ] && mv "/tmp/$FILE" /tmp/bun.tar.gz
+          fi
+          [ -s /tmp/bun.tar.gz ] || { echo "Bun download failed: $BUN_URL"; exit 1; }
+          if [ -n "$BUN_SHA256" ]; then
+            echo "$BUN_SHA256  /tmp/bun.tar.gz" | sha256sum -c
+            cp /tmp/bun.tar.gz /tmp/bun-dl-cache.tar.gz
+          fi
+          fi
+
+      - name: Save Bun archive cache
+        if: steps.restore.outputs.found_artifact != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/bun-dl-cache.tar.gz
+          key: dl-bun-linux-${{ env.BUN_SHA256 }}
+
+      - name: Setup Penryn Bun
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          mkdir -p /tmp/bun-extract
+          tar xzf /tmp/bun.tar.gz -C /tmp/bun-extract
+          if [ -f /tmp/bun-extract/bun.bin ]; then
+            sudo mkdir -p /opt/bun
+            sudo cp -r /tmp/bun-extract/* /opt/bun/
+          else
+            EXTRACTED=$(ls -d /tmp/bun-extract/*/ 2>/dev/null | head -1 || true)
+            if [ -n "$EXTRACTED" ]; then
+              sudo cp -r "$EXTRACTED" /opt/bun
+              if [ ! -f /opt/bun/bun.bin ] && [ -f /tmp/bun-extract/bun.bin ]; then
+                sudo cp /tmp/bun-extract/bun* /opt/bun/ 2>/dev/null || true
+              fi
+              if [ ! -d /opt/bun/lib ] && [ -d /tmp/bun-extract/lib ]; then
+                sudo cp -r /tmp/bun-extract/lib /opt/bun/ 2>/dev/null || true
+              fi
+            else
+              sudo mkdir -p /opt/bun
+              sudo cp -r /tmp/bun-extract/* /opt/bun/
+            fi
+          fi
+          if [ ! -f /opt/bun/bun.bin ] && [ -f /tmp/bun-extract/bun-release/bun.bin ]; then
+            sudo cp -r /tmp/bun-extract/bun-release/* /opt/bun/ 2>/dev/null || true
+          fi
+          ls -lh /opt/bun/ 2>&1 | head -10
+          printf '#!/bin/bash\nDIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"\nexport LD_LIBRARY_PATH="$DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\nexec "$DIR/bun.bin" "$@"\n' | sudo tee /opt/bun/bun > /dev/null
+          sudo chmod +x /opt/bun/bun /opt/bun/bun.bin
+          echo "/opt/bun" >> $GITHUB_PATH
+
+      - name: Pre-download Bubblewrap source
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          CACHE_DIR="/tmp/kilo-bubblewrap/$BWRAP_COMMIT"
+          mkdir -p "$CACHE_DIR"
+          if [ -f "$CACHE_DIR/bubblewrap-$BWRAP_COMMIT.tar.gz" ]; then
+            echo "Bubblewrap already cached"
+          else
+            for i in 1 2 3; do
+              curl -fsSL --connect-timeout 20 --max-time 900 "https://codeload.github.com/containers/bubblewrap/tar.gz/$BWRAP_COMMIT" \
+                -o "$CACHE_DIR/bubblewrap-$BWRAP_COMMIT.tar.gz" && break
+              [ $i -lt 3 ] && sleep 10
+            done
+            [ -s "$CACHE_DIR/bubblewrap-$BWRAP_COMMIT.tar.gz" ] || { echo "Bubblewrap download failed"; exit 1; }
+          fi
+          echo "$BWRAP_SHA256  $CACHE_DIR/bubblewrap-$BWRAP_COMMIT.tar.gz" | sha256sum -c
+          echo "KILO_BWRAP_CACHE=$CACHE_DIR" >> $GITHUB_ENV
+
+      - name: Restore source cache
+        id: src-cache
+        if: steps.restore.outputs.found_artifact != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/kilocode
+          key: src-kilocode-linux-${{ steps.tag.outputs.version }}
+
+      - name: Clone KiloCode
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          DIR="${{ github.workspace }}/kilocode"
+          if [ -d "$DIR/.git" ]; then
+            echo "reusing cached kilocode source"
+            cd "$DIR"
+            git fetch --depth 1 origin "${{ steps.tag.outputs.tag }}" || {
+              echo "fetch failed, recloning"
+              rm -rf "$DIR"
+              git clone --depth 1 --branch "${{ steps.tag.outputs.tag }}" \
+                https://github.com/kilo-org/kilocode.git "$DIR"
+              cd "$DIR"
+            }
+          else
+            rm -rf "$DIR"
+            for i in 1 2 3; do
+              git clone --depth 1 --branch "${{ steps.tag.outputs.tag }}" \
+                https://github.com/kilo-org/kilocode.git "$DIR" && break
+              [ $i -lt 3 ] && sleep 10
+            done
+          fi
+          [ -d "$DIR/.git" ] || exit 1
+          cd "$DIR"
+          git fetch --depth 1 origin "${{ steps.tag.outputs.tag }}" 2>/dev/null || true
+          git checkout FETCH_HEAD 2>/dev/null || git checkout "${{ steps.tag.outputs.tag }}" || exit 1
+          rm -rf packages/opencode/dist packages/kilo-vscode/out
+
+      - name: Save source cache
+        if: steps.restore.outputs.found_artifact != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/kilocode
+          key: src-kilocode-linux-${{ steps.tag.outputs.version }}
+
+      - name: Install deps
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          pip3 install -q gyp-next
+          cd "${{ github.workspace }}/kilocode"
+          bun install --frozen-lockfile
+        env:
+          LD_LIBRARY_PATH: /opt/bun/lib
+
+      - name: Build KiloCode CLI
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          cd "${{ github.workspace }}/kilocode/packages/opencode"
+          bun run build --single --skip-install
+        env:
+          LD_LIBRARY_PATH: /opt/bun/lib
+          KILO_VERSION: ${{ steps.tag.outputs.version }}
+          KILO_BWRAP_CACHE: ${{ env.KILO_BWRAP_CACHE }}
+
+      - name: Static ISA verify
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          BIN=$(find "${{ github.workspace }}/kilocode/packages/opencode/dist" -type f -name kilo 2>/dev/null | head -1 || true)
+          [ -n "$BIN" ] || { echo "Binary not found"; exit 1; }
+          objdump -d "$BIN" > /tmp/disasm.txt 2>/dev/null
+          echo "=== Instruction counts ==="
+          for pat in "popcnt" "vpopcntq" "vaes" "vzeroupper" "vpbroadcast" "vmovdqa\|vmovdqu"; do
+            echo "$pat: $(grep -c "\b$pat" /tmp/disasm.txt)"
+          done
+          echo "=== POPCNT check (must be 0) ==="
+          if grep -qE '\bpopcnt\b' /tmp/disasm.txt; then
+            echo "ERROR: POPCNT instructions present in binary"
+            grep -nE '\bpopcnt\b' /tmp/disasm.txt | head -10
+            exit 1
+          fi
+          echo "OK: zero POPCNT instructions"
+
+      - name: Bundle CLI libs + wrapper
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          CLI_BIN=$(find "${{ github.workspace }}/kilocode/packages/opencode/dist" -type d -path '*/bin' 2>/dev/null | head -1 || true)
+          [ -n "$CLI_BIN" ] || { echo "CLI bin dir not found"; exit 1; }
+          mkdir -p /tmp/bundle/bin /tmp/bundle/lib
+          cp -r "$CLI_BIN"/. /tmp/bundle/bin/
+          [ -f /tmp/bundle/bin/kilo ] || { echo "ERROR: kilo not found in bundle"; ls -la /tmp/bundle/bin/ | head; exit 1; }
+          mv /tmp/bundle/bin/kilo /tmp/bundle/bin/kilo.bin
+          cp /opt/bun/lib/libicui18n.so.74 /tmp/bundle/lib/
+          cp /opt/bun/lib/libicuuc.so.74 /tmp/bundle/lib/
+          cp /opt/bun/lib/libicudata.so.74 /tmp/bundle/lib/
+          cp /opt/bun/lib/libstdc++.so.6 /tmp/bundle/lib/
+          cp /opt/bun/lib/libgcc_s.so.1 /tmp/bundle/lib/
+          printf '#!/bin/bash\nDIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"\nexport LD_LIBRARY_PATH="$DIR/../lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\nexec "$DIR/kilo.bin" "$@"\n' > /tmp/bundle/bin/kilo
+          chmod +x /tmp/bundle/bin/kilo /tmp/bundle/bin/kilo.bin
+          LD_LIBRARY_PATH= /tmp/bundle/bin/kilo --version
+
+      - name: Install @vscode/vsce
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          bun install -g @vscode/vsce
+          VSCE_BIN="$(bun pm bin -g 2>/dev/null || echo "$HOME/.bun/bin")"
+          echo "$VSCE_BIN" >> $GITHUB_PATH
+          export PATH="$VSCE_BIN:$PATH"
+          VSCE=$(command -v vsce 2>/dev/null || true)
+          [ -n "$VSCE" ] || { echo "ERROR: vsce binary not found in $VSCE_BIN"; ls "$VSCE_BIN" | head -20; exit 1; }
+          echo "vsce at $VSCE"
+
+      - name: Patch VSIX build to linux-x64
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          cd "${{ github.workspace }}/kilocode/packages/kilo-vscode"
+          bun -e "
+            const fs = require('fs');
+            const f = 'script/build.ts';
+            let src = fs.readFileSync(f, 'utf8');
+            const start = src.indexOf('const targets = [');
+            const end = src.indexOf(']', start) + 1;
+            if (start < 0 || end < 0) { console.error('targets array not found'); process.exit(1); }
+            src = src.slice(0, start) + 'const targets = [\n  { target: \"linux-x64\", cliDir: \"@kilocode/cli-linux-x64\", binary: \"kilo\" },\n]' + src.slice(end);
+            fs.writeFileSync(f, src);
+            console.log('targets patched to linux-x64');
+          "
+
+      - name: Build VSIX
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          cd "${{ github.workspace }}/kilocode/packages/kilo-vscode"
+          bun run script/build.ts
+        env:
+          LD_LIBRARY_PATH: /opt/bun/lib
+          CLI_DIST_DIR: ../../packages/opencode/dist
+          KILO_VERSION: ${{ steps.tag.outputs.version }}
+
+      - name: Make VSIX self-contained
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          set -e
+          VSIX="${{ github.workspace }}/kilocode/packages/kilo-vscode/out/kilo-vscode-linux-x64.vsix"
+          WORK=$(mktemp -d)
+          unzip -q "$VSIX" -d "$WORK"
+          mv "$WORK/extension/bin/kilo" "$WORK/extension/bin/kilo.bin"
+          printf '%s\n' \
+            '#!/bin/bash' \
+            'DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"' \
+            'export LD_LIBRARY_PATH="$DIR/../lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"' \
+            'exec "$DIR/kilo.bin" "$@"' > "$WORK/extension/bin/kilo"
+          mkdir -p "$WORK/extension/lib"
+          cp /opt/bun/lib/libicui18n.so.74 /opt/bun/lib/libicuuc.so.74 /opt/bun/lib/libicudata.so.74 \
+             /opt/bun/lib/libstdc++.so.6 /opt/bun/lib/libgcc_s.so.1 "$WORK/extension/lib/"
+          chmod 755 "$WORK/extension/bin/kilo" "$WORK/extension/bin/kilo.bin"
+          (cd "$WORK" && zip -qr "$VSIX" extension.vsixmanifest "[Content_Types].xml" extension)
+          rm -rf "$WORK"
+          echo "VSIX made self-contained (wrapper + kilo.bin + ICU libs)"
+
+      - name: Verify VSIX
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          ls -la "${{ github.workspace }}/kilocode/packages/kilo-vscode/out/"
+          VSIX=$(ls "${{ github.workspace }}/kilocode/packages/kilo-vscode/out/"*.vsix 2>/dev/null | head -1 || true)
+          [ -n "$VSIX" ] || { echo "No VSIX produced"; exit 1; }
+          unzip -l "$VSIX" | grep -E 'bin/kilo|ffmpeg|lib/' | head -10 || true
+          TEST_DIR=$(mktemp -d)
+          unzip -q "$VSIX" -d "$TEST_DIR"
+          chmod +x "$TEST_DIR/extension/bin/kilo"
+          LD_LIBRARY_PATH= "$TEST_DIR/extension/bin/kilo" --version
+
+      - name: Stage built CLI + VSIX
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          mkdir -p /tmp/stage
+          cp -r /tmp/bundle /tmp/stage/cli
+          cp "${{ github.workspace }}/kilocode/packages/kilo-vscode/out/"*.vsix /tmp/stage/
+          ls -la /tmp/stage /tmp/stage/cli/bin
+
+      - name: Upload intermediate build
+        if: steps.restore.outputs.found_artifact != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage-kilocode-linux-x64-${{ steps.tag.outputs.version }}-${{ hashFiles('.github/workflows/build-kilocode.yml') }}
+          path: /tmp/stage
+
+      - name: Use restored build
+        if: steps.restore.outputs.found_artifact == 'true'
+        run: |
+          [ -f /tmp/stage/cli/bin/kilo.bin ] || { echo "restored CLI missing"; ls -la /tmp/stage; exit 1; }
+          ls /tmp/stage/*.vsix || { echo "restored VSIX missing"; ls -la /tmp/stage; exit 1; }
+
+      - name: Package artifact
+        run: |
+          mkdir -p /tmp/pkg/kilocode-penryn
+          cp -r /tmp/stage/cli /tmp/pkg/kilocode-penryn/cli
+          cp /tmp/stage/*.vsix /tmp/pkg/kilocode-penryn/
+          tar czf /tmp/kilocode-penryn-linux-x64.tar.gz -C /tmp/pkg kilocode-penryn
+
+      - name: Compute SHA256
+        id: sha256
+        run: |
+          SHA=$(sha256sum /tmp/kilocode-penryn-linux-x64.tar.gz | cut -d' ' -f1)
+          echo "sha256=$SHA" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: kilocode-penryn-${{ steps.tag.outputs.version }}-${{ github.run_id }}
+          name: KiloCode Penryn ${{ steps.tag.outputs.version }}
+          body: |
+            KiloCode ${{ steps.tag.outputs.version }} built for Penryn (SSE 4.1)
+            SHA256: ${{ steps.sha256.outputs.sha256 }}
+          files: /tmp/kilocode-penryn-linux-x64.tar.gz
+          draft: false
+          prerelease: false
+
+      - name: Upload artifact (backup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: kilocode-penryn-linux-x64
+          path: /tmp/kilocode-penryn-linux-x64.tar.gz

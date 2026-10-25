@@ -270,6 +270,16 @@ jobs:
           else
             echo "no Bun revision pin found (already patched or removed upstream)"
           fi
+          # Upstream picks the compile runtime as our penryn bun only when
+          # NIX_BUILD_TOP is set; otherwise it downloads the stock upstream
+          # bun (contains POPCNT) and the final binary fails the ISA verify.
+          # Force process.execPath (our penryn bun) for the native target.
+          if grep -q "process.env.NIX_BUILD_TOP &&" "$F"; then
+            sed -i 's/process.env.NIX_BUILD_TOP &&/true \&\&/' "$F"
+            echo "compile runtime forced to process.execPath in $F"
+          else
+            echo "no NIX_BUILD_TOP runtime selector found in $F"
+          fi
 
       - name: Install deps
         if: steps.restore.outputs.found_artifact != 'true'
